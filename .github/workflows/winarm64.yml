@@ -139,7 +139,7 @@ jobs:
           if [ "${{ steps.prepare.outcome }}" = success ]; then
             echo "key=$COMPLETE_KEY" >> "$GITHUB_OUTPUT"
           elif [ "$fp" != "${{ steps.before.outputs.fp }}" ]; then
-            echo "key=$CACHE_PREFIX${{ needs.plan.outputs.cache_key }}-partial-$fp" >> "$GITHUB_OUTPUT"
+            echo "key=${CACHE_PREFIX}${{ needs.plan.outputs.cache_key }}-partial-$fp" >> "$GITHUB_OUTPUT"
           else
             echo "Nothing new was built, keeping the existing cache."
           fi

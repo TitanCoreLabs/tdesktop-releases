@@ -53,11 +53,13 @@ runs:
         # the file locked after it returns, so deleting it fails the step.
         $installer = Join-Path $env:RUNNER_TEMP vs_buildtools.exe
         Invoke-WebRequest -Uri https://aka.ms/vs/18/stable/vs_buildtools.exe -OutFile $installer
+        # x64 ATL is for breakpad's dump_syms, which prepare.py builds for x64.
         $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
           '--quiet','--wait','--norestart','--nocache', `
           '--add','Microsoft.VisualStudio.Workload.VCTools', `
           '--add','Microsoft.VisualStudio.Component.VC.Tools.ARM64', `
-          '--add','Microsoft.VisualStudio.Component.VC.ATL.ARM64'
+          '--add','Microsoft.VisualStudio.Component.VC.ATL.ARM64', `
+          '--add','Microsoft.VisualStudio.Component.VC.ATL'
         if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit $p.ExitCode }
 
     - name: Native Tools Command Prompt
