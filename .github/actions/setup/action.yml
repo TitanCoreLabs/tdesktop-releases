@@ -49,13 +49,15 @@ runs:
     - name: Install VS 2026 Build Tools
       shell: pwsh
       run: |
-        Invoke-WebRequest -Uri https://aka.ms/vs/18/stable/vs_buildtools.exe -OutFile vs_buildtools.exe
-        $p = Start-Process -FilePath .\vs_buildtools.exe -Wait -PassThru -ArgumentList `
+        # Kept in the runner's temp folder: the bootstrapper can still hold
+        # the file locked after it returns, so deleting it fails the step.
+        $installer = Join-Path $env:RUNNER_TEMP vs_buildtools.exe
+        Invoke-WebRequest -Uri https://aka.ms/vs/18/stable/vs_buildtools.exe -OutFile $installer
+        $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
           '--quiet','--wait','--norestart','--nocache', `
           '--add','Microsoft.VisualStudio.Workload.VCTools', `
           '--add','Microsoft.VisualStudio.Component.VC.Tools.ARM64', `
           '--add','Microsoft.VisualStudio.Component.VC.ATL.ARM64'
-        Remove-Item vs_buildtools.exe -Force
         if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit $p.ExitCode }
 
     - name: Native Tools Command Prompt
