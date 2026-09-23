@@ -1,0 +1,244 @@
+name: Windows ARM64
+run-name: Windows ARM64 (${{ inputs.ref }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build
+        default: dev
+
+concurrency:
+  group: winarm64
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: TitanCoreLabs/tdesktop
+  CACHE_PREFIX: winarm64-deps- # Must match .github/actions/setup.
+
+jobs:
+
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      sdk: ${{ steps.source.outputs.sdk }}
+      cache_key: ${{ steps.source.outputs.cache_key }}
+      complete: ${{ steps.source.outputs.complete }}
+    steps:
+      - name: Check out build scripts
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          persist-credentials: false
+          sparse-checkout: |
+            Telegram/build
+            docs
+
+      - name: Resolve commit and cache key
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sdk=$(grep "SDK version" docs/building-win.md | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')
+          key=$( (cat Telegram/build/prepare/prepare.py Telegram/build/qt_version.py; echo "$sdk") | sha256sum | cut -c1-16)
+          complete_key="$CACHE_PREFIX$key-complete"
+          complete=$(gh cache list -R "$GITHUB_REPOSITORY" --key "$complete_key" --json key --jq "any(.[]; .key == \"$complete_key\")")
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "sdk=$sdk"
+            echo "cache_key=$key"
+            echo "complete=$complete"
+          } >> "$GITHUB_OUTPUT"
+
+  # Each pass resumes from the cache the previous one saved, because
+  # prepare.py skips stages whose cache_keys entry is up to date. A cold
+  # build gets three 6-hour jobs; passes after the finishing one exit early.
+  deps:
+    name: Dependencies (pass ${{ matrix.pass }})
+    needs: plan
+    if: needs.plan.outputs.complete != 'true'
+    runs-on: windows-11-arm
+    permissions:
+      actions: write # Deletes superseded dependency caches.
+      contents: read
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        pass: [1, 2, 3]
+    env:
+      COMPLETE_KEY: winarm64-deps-${{ needs.plan.outputs.cache_key }}-complete
+    steps:
+      - name: Check earlier passes
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          done=$(gh cache list -R "$GITHUB_REPOSITORY" --key "$COMPLETE_KEY" --json key --jq "any(.[]; .key == \"$COMPLETE_KEY\")")
+          echo "done=$done" >> "$GITHUB_OUTPUT"
+
+      - name: Check out workflow
+        if: steps.check.outputs.done != 'true'
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare build environment
+        if: steps.check.outputs.done != 'true'
+        uses: ./.github/actions/setup
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          sdk: ${{ needs.plan.outputs.sdk }}
+          cache-key: ${{ needs.plan.outputs.cache_key }}
+
+      - name: Fingerprint restored dependencies
+        id: before
+        if: steps.check.outputs.done != 'true'
+        shell: bash
+        run: |
+          fp=$({ grep -r . "$TBUILD/Libraries/cache_keys" "$TBUILD/ThirdParty/cache_keys" 2>/dev/null || true; } | sort | sha256sum | cut -c1-16)
+          echo "fp=$fp" >> "$GITHUB_OUTPUT"
+
+      # Stops early enough to leave time for saving the cache below.
+      - name: Build dependencies
+        id: prepare
+        if: steps.check.outputs.done != 'true'
+        timeout-minutes: 290
+        shell: cmd
+        run: call %TBUILD%\tdesktop\Telegram\build\prepare\win.bat silent qt6
+
+      - name: Trim dependencies
+        if: ${{ !cancelled() && (steps.prepare.outcome == 'success' || steps.prepare.outcome == 'failure') }}
+        shell: bash
+        run: |
+          if [ "${{ steps.prepare.outcome }}" != success ]; then
+            # A timed-out build can leave compilers running and holding files.
+            taskkill //F //T //IM cl.exe //IM link.exe //IM lib.exe //IM ninja.exe //IM jom.exe //IM nmake.exe //IM make.exe //IM cmake.exe //IM msbuild.exe > /dev/null 2>&1 || true
+          fi
+          # Keep only what later stages and the app build use; *.pc is for ffmpeg.
+          find "$TBUILD/Libraries" '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' ')' -type f ')' -o -empty ')' -delete
+
+      - name: Choose cache key
+        id: key
+        if: ${{ !cancelled() && (steps.prepare.outcome == 'success' || steps.prepare.outcome == 'failure') }}
+        shell: bash
+        run: |
+          fp=$({ grep -r . "$TBUILD/Libraries/cache_keys" "$TBUILD/ThirdParty/cache_keys" 2>/dev/null || true; } | sort | sha256sum | cut -c1-16)
+          if [ "${{ steps.prepare.outcome }}" = success ]; then
+            echo "key=$COMPLETE_KEY" >> "$GITHUB_OUTPUT"
+          elif [ "$fp" != "${{ steps.before.outputs.fp }}" ]; then
+            echo "key=$CACHE_PREFIX${{ needs.plan.outputs.cache_key }}-partial-$fp" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing new was built, keeping the existing cache."
+          fi
+
+      - name: Save dependencies
+        if: ${{ !cancelled() && steps.key.outputs.key != '' }}
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ github.workspace }}\TBuild\Libraries
+            ${{ github.workspace }}\TBuild\ThirdParty
+          key: ${{ steps.key.outputs.key }}
+
+      # Keeps storage under the 10 GB limit, but only once the new entry exists.
+      - name: Delete superseded caches
+        if: ${{ !cancelled() && steps.key.outputs.key != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_KEY: ${{ steps.key.outputs.key }}
+        run: |
+          saved=$(gh cache list -R "$GITHUB_REPOSITORY" --key "$NEW_KEY" --json key --jq "any(.[]; .key == \"$NEW_KEY\")")
+          [ "$saved" = true ] || exit 0
+          gh cache list -R "$GITHUB_REPOSITORY" --key "$CACHE_PREFIX" --limit 100 --json id,key \
+            --jq ".[] | select(.key != \"$NEW_KEY\") | .id" \
+            | xargs -r -n1 gh cache delete -R "$GITHUB_REPOSITORY"
+
+  build:
+    name: Telegram
+    needs: [plan, deps]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: windows-11-arm
+    permissions:
+      actions: read
+      contents: write # Creates the draft release.
+    steps:
+      - name: Check dependencies
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMPLETE_KEY: winarm64-deps-${{ needs.plan.outputs.cache_key }}-complete
+        run: |
+          done=$(gh cache list -R "$GITHUB_REPOSITORY" --key "$COMPLETE_KEY" --json key --jq "any(.[]; .key == \"$COMPLETE_KEY\")")
+          if [ "$done" != true ]; then
+            echo "::error::Dependencies are not finished yet. Run the workflow again to continue building them."
+            exit 1
+          fi
+
+      - name: Check out workflow
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Prepare build environment
+        uses: ./.github/actions/setup
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          sdk: ${{ needs.plan.outputs.sdk }}
+          cache-key: ${{ needs.plan.outputs.cache_key }}
+
+      - name: Dependencies
+        timeout-minutes: 60
+        shell: cmd
+        run: call %TBUILD%\tdesktop\Telegram\build\prepare\win.bat silent qt6
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cd %TBUILD%\tdesktop\Telegram
+          call configure.bat qt6 -G "Ninja Multi-Config" -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT= -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON
+
+      - name: Build
+        shell: cmd
+        run: cmake --build %TBUILD%\tdesktop\out --config Release --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path "$env:TBUILD\tdesktop\Telegram\build\version" -Pattern '^AppVersionStr\s+(\S+)').Matches[0].Groups[1].Value
+          $out = "$env:TBUILD\tdesktop\out\Release"
+          New-Item -ItemType Directory -Path package\Telegram | Out-Null
+          Copy-Item "$out\Telegram.exe" package\Telegram\
+          if (Test-Path "$out\modules") { Copy-Item "$out\modules" package\Telegram\ -Recurse }
+          Compress-Archive -Path package\Telegram -DestinationPath "tportable-arm64.$version.zip"
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      # Drafts are visible only to people with write access to this repository.
+      - name: Draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          tag="v$VERSION"
+          asset="tportable-arm64.$VERSION.zip"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" "$asset" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$asset" -R "$GITHUB_REPOSITORY" --draft --title "$tag" --notes "Built from ${SHA:0:10}."
+          fi
