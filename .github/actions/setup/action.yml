@@ -23,6 +23,8 @@ runs:
         mklink /d "%GITHUB_WORKSPACE%\TBuild" "%USERPROFILE%\TBuild"
         echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
 
+    # Checkout's credentials only apply to the exact path it configured,
+    # but git resolves the TBuild link, so clone outside it and move in.
     - name: Check out source
       uses: actions/checkout@v7
       with:
@@ -31,7 +33,11 @@ runs:
         token: ${{ inputs.token }}
         persist-credentials: false
         submodules: recursive
-        path: TBuild\tdesktop
+        path: src
+
+    - name: Move source into place
+      shell: cmd
+      run: move "%GITHUB_WORKSPACE%\src" "%USERPROFILE%\TBuild\tdesktop"
 
     - name: Configure tools
       shell: bash
